@@ -1,4 +1,4 @@
-# controller.py - FIXED VERSION
+# controller.py - IMPROVED FAST VERSION
 
 import asyncio
 import websockets
@@ -18,23 +18,26 @@ class RobotController:
         self.known_obstacles = [] 
         self.path = []
         self.ws = None
-        # FIXED: Increased grid size and inflation for better clearance
+        # Grid size and inflation for better clearance
         self.planner = AStarPlanner(grid_size=25, inflation_radius=3)
         self.mapper = ObstacleMapper() 
         self.server_url = "http://localhost:5001"
         self.is_collided = False
         self.goal_reached = False
         self.current_waypoint_index = 0
-        # FIXED: Slower sensing for more careful navigation
-        self.sensing_interval = 0.15
-        # FIXED: Add step size for gradual movement
-        self.step_size = 15
+        
+        # IMPROVED: Dynamic parameters for speed optimization
+        self.base_sensing_interval = 0.05  # Much faster base sensing
+        self.obstacle_sensing_interval = 0.15  # Slower when near obstacles
+        self.min_step_size = 25  # Larger minimum steps
+        self.max_step_size = 50  # Even larger steps when path is clear
+        self.safe_distance_threshold = 80  # Distance to consider "safe" from obstacles
 
     async def _capture_and_map(self):
         """Captures the environment, updates the map, and returns True if new obstacles are detected."""
         try:
             url = f"{self.server_url}/capture"
-            r = requests.get(url, timeout=1.0)  # Increased timeout
+            r = requests.get(url, timeout=1.0)
             r.raise_for_status()
             data = r.json()
 
@@ -54,6 +57,40 @@ class RobotController:
         except requests.exceptions.RequestException as e:
             print(f"Sensing failed: {e}")
             return False
+
+    def _get_nearest_obstacle_distance(self, x, y):
+        """Get distance to nearest known obstacle"""
+        if not self.known_obstacles:
+            return float('inf')
+        
+        min_dist = float('inf')
+        for obs in self.known_obstacles:
+            dist = math.hypot(x - obs['x'], y - obs['y'])
+            min_dist = min(min_dist, dist)
+        return min_dist
+
+    def _is_path_clear_to_waypoint(self, current_pos, waypoint):
+        """Check if path to waypoint is clear of obstacles"""
+        x1, y1 = current_pos
+        x2, y2 = waypoint
+        
+        # Sample points along the path
+        distance = math.hypot(x2 - x1, y2 - y1)
+        if distance == 0:
+            return True
+            
+        num_samples = max(3, int(distance / 20))  # Sample every 20 pixels
+        
+        for i in range(1, num_samples + 1):
+            t = i / num_samples
+            sample_x = x1 + t * (x2 - x1)
+            sample_y = y1 + t * (y2 - y1)
+            
+            # Check if sample point is too close to obstacles
+            if self._get_nearest_obstacle_distance(sample_x, sample_y) < 40:  # Safety margin
+                return False
+        
+        return True
 
     async def _reset_and_reinit_env(self):
         """Calls /reset, then re-sends all known obstacles for the next plan."""
@@ -100,9 +137,9 @@ class RobotController:
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
             print(f"Move command failed: {e}")
-            
-    def _gradual_move_to_waypoint(self, target_x, target_y):
-        """Move gradually towards waypoint in smaller steps"""
+    
+    def _adaptive_move_to_waypoint(self, target_x, target_y):
+        """Adaptively move towards waypoint - larger steps when safe, smaller when near obstacles"""
         current_x, current_y = self.robot_pos
         
         # Calculate direction vector
@@ -113,8 +150,27 @@ class RobotController:
         if distance == 0:
             return [(target_x, target_y)]
         
-        # Normalize direction and create intermediate points
-        steps = max(1, int(distance / self.step_size))
+        # Determine step size based on proximity to obstacles
+        nearest_obstacle_dist = self._get_nearest_obstacle_distance(current_x, current_y)
+        
+        # Adaptive step size: larger when far from obstacles, smaller when close
+        if nearest_obstacle_dist > self.safe_distance_threshold:
+            step_size = self.max_step_size  # Large steps when safe
+            print(f"🏃 Fast movement: nearest obstacle {nearest_obstacle_dist:.1f}px away")
+        elif nearest_obstacle_dist > 50:
+            step_size = (self.min_step_size + self.max_step_size) // 2  # Medium steps
+            print(f"🚶 Medium movement: nearest obstacle {nearest_obstacle_dist:.1f}px away")
+        else:
+            step_size = self.min_step_size  # Small steps when close to obstacles
+            print(f"🐌 Careful movement: nearest obstacle {nearest_obstacle_dist:.1f}px away")
+        
+        # If path is clear and distance is reasonable, move directly
+        if distance <= step_size * 1.5 and self._is_path_clear_to_waypoint((current_x, current_y), (target_x, target_y)):
+            print(f"✨ Direct movement to waypoint: {distance:.1f}px")
+            return [(target_x, target_y)]
+        
+        # Create intermediate points with adaptive step size
+        steps = max(1, int(distance / step_size))
         step_x = dx / steps
         step_y = dy / steps
         
@@ -123,7 +179,8 @@ class RobotController:
             new_x = current_x + step_x * i
             new_y = current_y + step_y * i
             intermediate_points.append((int(new_x), int(new_y)))
-            
+        
+        print(f"📍 Moving in {len(intermediate_points)} steps (step_size: {step_size})")
         return intermediate_points
             
     async def _listen_for_feedback(self):
@@ -210,37 +267,49 @@ class RobotController:
 
                 print(f"✅ Planned path with {len(self.path)} waypoints")
                 
-            # Execute the planned path with gradual movement
+            # Execute the planned path with adaptive movement
             while self.current_waypoint_index < len(self.path) and not self.is_collided and not self.goal_reached:
                 waypoint = self.path[self.current_waypoint_index]
                 print(f"🎯 Moving to waypoint {self.current_waypoint_index + 1}/{len(self.path)}: ({waypoint[0]}, {waypoint[1]})")
                 
-                # Move gradually to waypoint
-                intermediate_points = self._gradual_move_to_waypoint(waypoint[0], waypoint[1])
+                # IMPROVED: Adaptive movement to waypoint
+                intermediate_points = self._adaptive_move_to_waypoint(waypoint[0], waypoint[1])
                 
-                for point in intermediate_points:
+                # Determine sensing frequency based on proximity to obstacles
+                current_nearest_dist = self._get_nearest_obstacle_distance(self.robot_pos[0], self.robot_pos[1])
+                if current_nearest_dist > self.safe_distance_threshold:
+                    sensing_interval = self.base_sensing_interval  # Fast sensing when safe
+                else:
+                    sensing_interval = self.obstacle_sensing_interval  # Careful sensing near obstacles
+                
+                for point_idx, point in enumerate(intermediate_points):
                     if self.is_collided or self.goal_reached:
                         break
                         
                     self.move_to(point[0], point[1])
                     self.robot_pos = point
                     
-                    # Check for obstacles during movement
-                    await asyncio.sleep(self.sensing_interval)
+                    # IMPROVED: Adaptive sensing - sense more frequently only when needed
+                    await asyncio.sleep(sensing_interval)
                     
-                    # Proactive obstacle detection during transit
-                    if await self._capture_and_map():
-                        print("🚨 New obstacle detected during movement - breaking to replan")
-                        break
+                    # Only check for new obstacles every few steps when moving fast
+                    if point_idx == len(intermediate_points) - 1 or point_idx % max(1, len(intermediate_points) // 3) == 0:
+                        if await self._capture_and_map():
+                            print("🚨 New obstacle detected during movement - breaking to replan")
+                            break
                 
                 if not self.is_collided and not await self._capture_and_map():
                     self.current_waypoint_index += 1
                 else:
                     break  # Replan needed
 
-            # Brief pause before next iteration
+            # IMPROVED: Minimal pause between iterations when moving fast
             if not self.is_collided and not self.goal_reached:
-                await asyncio.sleep(0.2)
+                current_nearest_dist = self._get_nearest_obstacle_distance(self.robot_pos[0], self.robot_pos[1])
+                if current_nearest_dist > self.safe_distance_threshold:
+                    await asyncio.sleep(0.05)  # Very short pause when safe
+                else:
+                    await asyncio.sleep(0.2)   # Longer pause when near obstacles
                 
         print("🏁 Path execution loop finished.")
             
